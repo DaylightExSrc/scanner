@@ -1,0 +1,1881 @@
+--[[
+	INFIN FINDER  —  scanner + server hopper for Infin AJ  (discord.gg/infinhub)
+
+	Run this on your finder account(s). In every server it:
+	  1. scans every base for brainrots and works out their real M/s
+	  2. posts anything above your minimum to your feed (free Firebase database) with the JobId,
+	     and to your Discord webhook with the brainrot's picture from the wiki
+	  3. leaves for a fresh server straight away and does it again (re-runs itself after teleport)
+
+	Infin AJ users with the same FEED URL get each find as a log they can join.
+
+	To keep hopping, the script has to re-run after each teleport. Either:
+	  • save this file as  workspace/InfinFinder.lua  in your executor folder, or
+	  • host it and put  loadstring(game:HttpGet("your raw url"))()  in LOADER below
+]]
+
+local DEFAULTS = {
+	FEED_URL   = "https://aj67-a-default-rtdb.firebaseio.com",   -- your Firebase database
+	FEED_AUTH  = "",   -- optional database secret, if you locked the rules
+	-- extra websockets: every log is also posted here (Infin AJ users pick one)
+	EU_FEED    = "https://websoker-b0de9-default-rtdb.europe-west1.firebasedatabase.app",
+	WEBHOOK    = "https://discord.com/api/webhooks/1561370316318441592/0WwSFctLm7cywkddLndZx0tlLbiYI-yJZKBjcCWmi_BbbARn_LAUInrNb2tkYsbq4CX6",   -- $2B/s and up (Ultralights)
+	STEAL_WEBHOOK = "https://discord.com/api/webhooks/1561068362799259661/XxXJahlRdKmspqBpZjxEpFbmTRsO0wENWDceAqD_FXlkh0NUgWTpfqGMJDloEIZf8noR",   -- steal logs from Infin AJ users
+	MIN_LOG    = 0,                                 -- log everything (0 = no minimum)
+	-- where each find goes, by how much it makes
+	LOW_WEBHOOK  = "https://discord.com/api/webhooks/1561466224527802439/uUUkmctecOzxPEo6l2Aq2cfVCsR1i52XujL7yRzbRptdupGMLfcs9mAP9w1opsaKwySV",  -- $10M/s and below
+	MID_WEBHOOK  = "https://discord.com/api/webhooks/1561466559384395826/aoFnv1lqWgrqDpiG1abGHDirXToxFBBsyOtnK_Jmj863qbAkK2NcC_XPfyJTZs8AhhU6",  -- $10M/s to $200M/s
+	HIGH_WEBHOOK = "https://discord.com/api/webhooks/1561466828805382329/RCpIarWG4HgbJPw5jDOFz2N8OgBU2PlwZVBdAU000aa6d-h5BjR8STCY3aFF4Ksicgw0", -- $200M/s to $2B/s
+	OG_WEBHOOK   = "https://discord.com/api/webhooks/1561466950977069111/Ch8ml_1p6kvoWlaXLM6dV8Dh6iNIfmlrYBuvR9dL_UExLi8RJ-VtCyF8VChcBd4ixlOX",  -- every OG
+	SCAN_TIME  = 3,                               -- most seconds to wait for bases to load before scanning + hopping
+	AUTO_HOP   = true,
+	CARPET     = true,                              -- also log brainrots walking the carpet
+	BLACKLIST  = {},                                -- brainrot names to never log, e.g. { "Noobini Pizzanini" }
+	MIN_PLAYERS = 4,                                -- prefer servers with at least this many players
+	LOADER     = "",                                -- optional: code that re-runs this script
+	-- Discord voice channel that shows 🟢 ONLINE / 🔴 OFFLINE (needs a bot with Manage Channels)
+	BOT_TOKEN      = "",                            -- your Discord bot token (keep this script private)
+	STATUS_CHANNEL = "1561464493442076782",         -- the voice channel's ID
+	ONLINE_NAME    = "🟢 ONLINE",
+	OFFLINE_NAME   = "🔴 OFFLINE",
+	SCRIPT_FILE = "InfinFinder.lua",                -- used when LOADER is blank
+	OPTIMIZE    = true,                             -- bots: turn off 3D drawing, effects + cap FPS (scanning still works)
+	FPS_CAP     = 30,
+}
+
+---------------------------------------------------------------- services
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local UIS               = game:GetService("UserInputService")
+local HttpService       = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService   = game:GetService("TeleportService")
+local RunService        = game:GetService("RunService")
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+-- optimizer: the bot never needs to SEE the game, it only reads the instances
+if DEFAULTS.OPTIMIZE then
+	pcall(function() RunService:Set3dRenderingEnabled(false) end)
+	pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+	pcall(function() if setfpscap then setfpscap(DEFAULTS.FPS_CAP or 30) end end)
+	pcall(function()
+		local L = game:GetService("Lighting")
+		L.GlobalShadows = false
+		L.FogEnd = 1e6
+		for _, o in ipairs(L:GetChildren()) do
+			if o:IsA("PostEffect") then o.Enabled = false end
+		end
+		workspace.Terrain.Decoration = false
+	end)
+	local function quiet(o)
+		if o:IsA("ParticleEmitter") or o:IsA("Trail") or o:IsA("Beam")
+			or o:IsA("Smoke") or o:IsA("Fire") or o:IsA("Sparkles") then
+			pcall(function() o.Enabled = false end)
+		end
+	end
+	task.spawn(function()
+		for i, o in ipairs(workspace:GetDescendants()) do
+			quiet(o)
+			if i % 4000 == 0 then task.wait() end
+		end
+	end)
+	workspace.DescendantAdded:Connect(quiet)
+end
+
+-- only one finder per server (auto-execute + re-run after hop could both start it)
+do
+	local env = (getgenv and getgenv()) or _G
+	if env.__InfinFinderJob == game.JobId then return end
+	env.__InfinFinderJob = game.JobId
+end
+local player = Players.LocalPlayer
+while not player do task.wait(); player = Players.LocalPlayer end
+local PlayerGui = player:WaitForChild("PlayerGui")
+
+---------------------------------------------------------------- executor bits
+local httpRequest = (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request) or http_request or request
+local queueTeleport = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+local canFS = typeof(writefile) == "function" and typeof(readfile) == "function"
+
+local DIR = "InfinFinder"
+local CFG_FILE, STATE_FILE = DIR .. "/config.json", DIR .. "/state.json"
+
+local function ensureDir()
+	if typeof(makefolder) == "function" and (typeof(isfolder) ~= "function" or not isfolder(DIR)) then
+		pcall(makefolder, DIR)
+	end
+end
+
+local function loadJSON(path)
+	if not canFS then return nil end
+	local ok, data = pcall(function()
+		if typeof(isfile) == "function" and not isfile(path) then return nil end
+		return HttpService:JSONDecode(readfile(path))
+	end)
+	return ok and data or nil
+end
+
+local function saveJSON(path, data)
+	if not canFS then return end
+	ensureDir()
+	pcall(writefile, path, HttpService:JSONEncode(data))
+end
+
+local Config = table.clone(DEFAULTS)
+for k, v in pairs(loadJSON(CFG_FILE) or {}) do
+	if Config[k] ~= nil and type(v) == type(Config[k]) then Config[k] = v end
+end
+for _, k in ipairs({ "FEED_URL", "WEBHOOK", "STEAL_WEBHOOK", "LOW_WEBHOOK", "MID_WEBHOOK", "HIGH_WEBHOOK", "OG_WEBHOOK" }) do
+	if Config[k] == "" then Config[k] = DEFAULTS[k] end
+end
+local function saveConfig() saveJSON(CFG_FILE, Config) end
+
+-- survives teleports: servers visited, totals
+local State = loadJSON(STATE_FILE) or {}
+State.visited = State.visited or {}
+State.servers = State.servers or 0
+State.posted = State.posted or 0
+local saveVisited -- set further down, once teleport settings are read
+local function saveState()
+	saveJSON(STATE_FILE, State)
+	if saveVisited then saveVisited() end
+end
+
+--[[
+	What the last server handed over through the teleport itself: the servers
+	already visited and the totals. This works even when the executor can't
+	save files, which is what made it keep landing in the same server.
+]]
+local Arrival = {}
+pcall(function()
+	local td = TeleportService:GetLocalPlayerTeleportData()
+	if type(td) == "table" and td.infin then Arrival = td end
+end)
+for _, id in ipairs(type(Arrival.visited) == "table" and Arrival.visited or {}) do
+	if type(id) == "string" then State.visited[id] = State.visited[id] or os.time() end
+end
+State.servers = math.max(State.servers, tonumber(Arrival.servers) or 0)
+State.posted = math.max(State.posted, tonumber(Arrival.posted) or 0)
+local landedSameServer = type(Arrival.from) == "string" and Arrival.from == game.JobId
+
+--[[
+	Teleport settings live for the whole Roblox session and survive every
+	teleport, no files needed. Two lists:
+	  InfinFinder_Visited  servers we've been to (never picked again)
+	  InfinFinder_Logged   servers already scanned + logged (never logged twice)
+]]
+local TS_VISITED, TS_LOGGED = "InfinFinder_Visited", "InfinFinder_Logged"
+local function tsGet(key)
+	local ok, v = pcall(TeleportService.GetTeleportSetting, TeleportService, key)
+	return (ok and type(v) == "table") and v or {}
+end
+local function tsSet(key, v) pcall(TeleportService.SetTeleportSetting, TeleportService, key, v) end
+
+local Logged = tsGet(TS_LOGGED)
+for id, t in pairs(tsGet(TS_VISITED)) do
+	if type(id) == "string" then State.visited[id] = State.visited[id] or tonumber(t) or os.time() end
+end
+-- this server was already logged (or Roblox bounced us straight back): don't log it again
+local alreadyLogged = Logged[game.JobId] ~= nil or landedSameServer
+
+saveVisited = function()
+	local copy = {}
+	for id, t in pairs(State.visited) do copy[id] = t end
+	tsSet(TS_VISITED, copy)
+end
+local function markLogged()
+	Logged[game.JobId] = os.time()
+	local now = os.time()
+	for id, t in pairs(Logged) do
+		if now - (tonumber(t) or 0) > 2700 then Logged[id] = nil end
+	end
+	tsSet(TS_LOGGED, Logged)
+end
+
+-- forget servers visited more than 45 minutes ago
+do
+	local now = os.time()
+	for id, t in pairs(State.visited) do
+		if now - (tonumber(t) or 0) > 2700 then State.visited[id] = nil end
+	end
+	State.visited[game.JobId] = now
+	State.servers += 1
+	saveState()
+end
+
+---------------------------------------------------------------- helpers
+local function fmtMoney(n)
+	if type(n) ~= "number" or n <= 0 then return "$?/s" end
+	local suf = { "", "K", "M", "B", "T", "Qd", "Qn" }
+	local i = 1
+	while n >= 1000 and i < #suf do n /= 1000; i += 1 end
+	return "$" .. (string.format("%.1f", n):gsub("%.0$", "")) .. suf[i] .. "/s"
+end
+
+local function parseMoney(str)
+	str = tostring(str or ""):lower():gsub("[%s%$,]", ""):gsub("/s", "")
+	local num, suf = str:match("([%d%.]+)(%a*)")
+	num = tonumber(num)
+	if not num then return 0 end
+	return num * (({ k = 1e3, m = 1e6, b = 1e9, t = 1e12, qd = 1e15, qa = 1e15, qn = 1e18 })[suf] or 1)
+end
+
+local function request(opts)
+	if not httpRequest then return nil, "your executor has no request()" end
+	local ok, res = pcall(httpRequest, opts)
+	if not ok then return nil, tostring(res) end
+	return res
+end
+
+-- tries request(), then game:HttpGet (some phone executors block request() to roblox.com)
+local function httpGetJSON(url)
+	local res = request({ Url = url, Method = "GET" })
+	if res and res.StatusCode == 200 then
+		local ok, data = pcall(HttpService.JSONDecode, HttpService, res.Body)
+		if ok and type(data) == "table" then return data, 200 end
+	end
+	if res and res.StatusCode == 429 then return nil, 429 end
+	local ok, body = pcall(function() return game:HttpGet(url) end)
+	if ok and type(body) == "string" then
+		local ok2, data = pcall(HttpService.JSONDecode, HttpService, body)
+		if ok2 and type(data) == "table" then return data, 200 end
+	end
+	return nil, res and res.StatusCode or "blocked"
+end
+
+---------------------------------------------------------------- game data (M/s)
+local Animals = {}
+do
+	local function safeRequire(inst)
+		if not inst then return nil end
+		local ok, mod = pcall(require, inst)
+		if ok and type(mod) == "table" then return mod end
+	end
+	local function datas(name)
+		local d = ReplicatedStorage:FindFirstChild("Datas")
+		return d and d:FindFirstChild(name)
+	end
+	local _api, _data, _muts, _traits
+	function Animals.API()
+		if _api ~= nil then return _api or nil end
+		_api = false
+		for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+			if d:IsA("ModuleScript") and d.Name:lower():find("animal") then
+				local m = safeRequire(d)
+				if type(m) == "table" and rawget(m, "CalculateGeneration") then _api = m; return m end
+			end
+		end
+		return nil
+	end
+	function Animals.Data()
+		if _data == nil then _data = safeRequire(datas("Animals")) or false end
+		return _data or nil
+	end
+	function Animals.Mutations()
+		if _muts == nil then _muts = safeRequire(datas("Mutations")) or false end
+		return _muts or nil
+	end
+	function Animals.Traits()
+		if _traits == nil then _traits = safeRequire(datas("Traits")) or false end
+		return _traits or nil
+	end
+
+	function Animals.generation(name, mutation, traits)
+		local api = Animals.API()
+		if api then
+			local ok, v = pcall(function() return api:CalculateGeneration(name, mutation, traits and traits[1]) end)
+			v = tonumber(v)
+			if ok and v and v > 0 then return v end
+		end
+		local d = Animals.Data()
+		local e = d and d[name]
+		local base = type(e) == "table" and tonumber(e.Generation)
+		if not base then return 0 end
+		local mult = 1
+		if mutation then
+			local M = Animals.Mutations()
+			local mi = M and M[mutation]
+			mult = (type(mi) == "table" and tonumber(mi.Modifier)) and (tonumber(mi.Modifier) + 1)
+				or ({ Gold = 1.25, Diamond = 1.5, Rainbow = 10 })[mutation] or 1
+		end
+		local add = 0
+		local Tr = Animals.Traits()
+		for _, t in ipairs(traits or {}) do
+			local ti = Tr and Tr[t]
+			if type(ti) == "table" and tonumber(ti.MultiplierModifier) then add += tonumber(ti.MultiplierModifier) end
+		end
+		return base * (mult + add)
+	end
+end
+
+---------------------------------------------------------------- scanner
+local Scanner = {}
+
+local function attr(inst, keys)
+	for _, k in ipairs(keys) do
+		local ok, v = pcall(inst.GetAttribute, inst, k)
+		if ok and v ~= nil and v ~= "" then return v end
+	end
+end
+
+-- who owns a base: attributes, an Owner value, or the sign text "Name's Base"
+local function plotOwner(plot)
+	local v = attr(plot, { "Owner", "OwnerName", "PlayerName", "OwnerUserId", "UserId" })
+	if typeof(v) == "Instance" and v:IsA("Player") then return v.Name end
+	if type(v) == "number" then
+		local p = Players:GetPlayerByUserId(v)
+		return p and p.Name or tostring(v)
+	end
+	if type(v) == "string" then return v end
+	for _, key in ipairs({ "Owner", "OwnerName", "Player" }) do
+		local c = plot:FindFirstChild(key)
+		if c and c:IsA("ObjectValue") and c.Value then return c.Value.Name end
+		if c and c:IsA("StringValue") and c.Value ~= "" then return c.Value end
+	end
+	for _, d in ipairs(plot:GetDescendants()) do
+		if d:IsA("TextLabel") then
+			local t = d.Text:gsub("<[^>]->", "")
+			-- your own base is labelled "YOUR BASE" on your screen, not "Name's Base"
+			if t:upper():find("YOUR BASE", 1, true) then return player.Name end
+			local who = t:match("^(.-)'s [Bb]ase")
+			if who and who ~= "" then return who end
+		end
+	end
+	return nil
+end
+
+local function readTraits(v)
+	local out = {}
+	if type(v) == "string" and v ~= "" then
+		local ok, decoded = pcall(HttpService.JSONDecode, HttpService, v)
+		if ok and type(decoded) == "table" then
+			for _, t in ipairs(decoded) do if type(t) == "string" then table.insert(out, t) end end
+		else
+			for t in v:gmatch("[^,%s]+") do table.insert(out, t) end
+		end
+	end
+	return out
+end
+
+local function plain(t)
+	return (tostring(t or ""):gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- the sign shows the display name; turn it back into the game's data key
+local nameIndex
+local function dataKey(text)
+	local D = Animals.Data()
+	if not D or D[text] then return text end
+	if not nameIndex then
+		nameIndex = {}
+		for k, e in pairs(D) do
+			if type(k) == "string" and type(e) == "table" then
+				nameIndex[k:lower()] = k
+				if type(e.DisplayName) == "string" then nameIndex[e.DisplayName:lower()] = k end
+			end
+		end
+	end
+	return nameIndex[text:lower()] or text
+end
+
+-- reads one brainrot sign: name, the exact $X/s the game shows, mutation, rarity
+local function readSign(gui)
+	local name, gen, mutation, rarity
+	for _, d in ipairs(gui:GetDescendants()) do
+		if d:IsA("TextLabel") then -- hidden-by-distance signs still hold the real numbers
+			local t = plain(d.Text)
+			if t ~= "" then
+				local n = d.Name
+				if n == "DisplayName" then
+					name = t
+				elseif n == "Generation" then
+					gen = parseMoney(t)
+				elseif n == "Mutation" then
+					mutation = t
+				elseif n == "Rarity" then
+					rarity = t
+				elseif not gen and t:find("/s") then
+					gen = parseMoney(t)
+				end
+			end
+		end
+	end
+	if mutation then
+		local l = mutation:lower()
+		if l == "normal" or l == "none" then mutation = nil end
+	end
+	return name, gen, mutation, rarity
+end
+
+local function isSign(g)
+	return g:IsA("BillboardGui") and (g.Name == "AnimalOverhead"
+		or (g:FindFirstChild("DisplayName", true) and g:FindFirstChild("Generation", true))) and true or false
+end
+
+--[[
+	Waits only as long as the bases actually need: streams every base in if
+	the game uses streaming, then stops as soon as the number of signs stops
+	changing (or MAX_LOAD_WAIT runs out).
+]]
+function Scanner.waitLoaded(maxWait)
+	local plots = workspace:FindFirstChild("Plots") or workspace:WaitForChild("Plots", maxWait)
+	if not plots then return end
+	if workspace.StreamingEnabled then
+		for _, plot in ipairs(plots:GetChildren()) do
+			task.spawn(function()
+				pcall(function() player:RequestStreamAroundAsync(plot:GetPivot().Position, 1) end)
+			end)
+		end
+	end
+	-- done once the number of signs + brainrot models stops changing for ~0.6s
+	local D = Animals.Data()
+	local t0, last, stable = os.clock(), -1, 0
+	while os.clock() - t0 < maxWait do
+		local n = 0
+		for _, g in ipairs(plots:GetDescendants()) do
+			if g:IsA("BillboardGui") or (D and g:IsA("Model") and type(D[g.Name]) == "table") then n += 1 end
+		end
+		if n > 0 and n == last then stable += 1 else stable = 0 end
+		if stable >= 3 and os.clock() - t0 > 0.6 then break end
+		last = n
+		task.wait(0.2)
+	end
+end
+
+-- which physical brainrot a sign belongs to (so one brainrot is never counted twice)
+local function signOwnerModel(g)
+	local m = g.Adornee
+	if m and not m:IsA("Model") then m = m:FindFirstAncestorOfClass("Model") end
+	return m or g:FindFirstAncestorOfClass("Model") or g.Parent
+end
+-- someone is carrying it (stolen brainrots ride next to a player)
+local function nearAPlayer(model)
+	local ok, pos = pcall(function() return model:GetPivot().Position end)
+	if not ok then return false end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local hrp = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
+		if hrp and (hrp.Position - pos).Magnitude < 10 then return true end
+	end
+	return false
+end
+local function blacklisted(name)
+	for _, n in ipairs(Config.BLACKLIST or {}) do
+		if type(n) == "string" and n:lower() == tostring(name):lower() then return true end
+	end
+	for _, n in ipairs(DEFAULTS.BLACKLIST or {}) do
+		if type(n) == "string" and n:lower() == tostring(name):lower() then return true end
+	end
+	return false
+end
+
+function Scanner.scan()
+	local plots = workspace:FindFirstChild("Plots")
+	if not plots then return {}, "no Plots folder" end
+	local D = Animals.Data()
+	local counted = {} -- [model] = true
+	local function real(name)
+		-- with the game's data loaded, only real brainrot names count
+		return not blacklisted(name) and (not D or type(D[name]) == "table")
+	end
+
+	local found = {}
+	for _, plot in ipairs(plots:GetChildren()) do
+		local owner = plotOwner(plot)
+		if owner ~= player.Name and owner ~= player.DisplayName then
+			-- 1) the game's own signs: the real M/s, mutation + traits already counted
+			local signCount = {} -- [name] = how many signs this base has for it
+			for _, g in ipairs(plot:GetDescendants()) do
+				if isSign(g) then
+					local name, gen, mutation, rarity = readSign(g)
+					local mdl = signOwnerModel(g)
+					if name and gen and gen > 0 and not counted[g] then
+						local key = dataKey(name)
+						if real(key) then
+							counted[g] = true
+							if mdl then counted[mdl] = true end
+							signCount[key] = (signCount[key] or 0) + 1
+							local e = D and D[key]
+							table.insert(found, {
+								name = key, mutation = mutation, traits = {},
+								tierName = rarity or (type(e) == "table" and e.Rarity) or nil,
+								mps = gen, owner = owner, exact = true,
+							})
+						end
+					end
+				end
+			end
+
+			-- 2) every brainrot model on the base: anything the signs missed (signs that
+			--    haven't loaded, or none at all) gets the game's own M/s formula
+			if D then
+				local models = {} -- [name] = { model, ... }
+				for _, m in ipairs(plot:GetDescendants()) do
+					if m:IsA("Model") and type(D[m.Name]) == "table" and not blacklisted(m.Name)
+						and m:FindFirstChildWhichIsA("BasePart", true) then
+						-- skip a brainrot model nested inside another one (accessories / parts)
+						local parent = m.Parent
+						local nested = false
+						while parent and parent ~= plot do
+							if parent:IsA("Model") and type(D[parent.Name]) == "table" then nested = true break end
+							parent = parent.Parent
+						end
+						if not nested then
+							models[m.Name] = models[m.Name] or {}
+							table.insert(models[m.Name], m)
+						end
+					end
+				end
+				for name, list in pairs(models) do
+					local extra = #list - (signCount[name] or 0)
+					for i = #list - extra + 1, #list do
+						local m = list[i]
+						if m and not counted[m] then
+							counted[m] = true
+							local mutation = attr(m, { "Mutation", "Variant" }) or (m.Parent and attr(m.Parent, { "Mutation" }))
+							if mutation == "None" or mutation == "Normal" then mutation = nil end
+							local traits = readTraits(attr(m, { "Traits", "Trait" }) or (m.Parent and attr(m.Parent, { "Traits" })))
+							local mps = Animals.generation(name, mutation, traits)
+							if mps and mps > 0 then
+								table.insert(found, {
+									name = name, mutation = mutation, traits = traits, tierName = D[name].Rarity,
+									mps = mps, owner = owner, exact = false,
+								})
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	-- 3) the carpet: brainrots walking the spawn lane. Only real brainrots, each once,
+	--    and never one a player is carrying (that's a steal in progress, not a carpet spawn)
+	if Config.CARPET then
+		local cam = workspace.CurrentCamera
+		for _, child in ipairs(workspace:GetChildren()) do
+			if child ~= plots and child ~= cam and not child:IsA("Terrain")
+				and not Players:GetPlayerFromCharacter(child) then
+				local list = child:IsA("BillboardGui") and { child } or child:GetDescendants()
+				for _, g in ipairs(list) do
+					if isSign(g) then
+						local name, gen, mutation, rarity = readSign(g)
+						local mdl = signOwnerModel(g)
+						if name and gen and gen > 0 and mdl and not counted[mdl] then
+							local key = dataKey(name)
+							if real(key) and not nearAPlayer(mdl) then
+								counted[mdl] = true
+								local e = D and D[key]
+								table.insert(found, {
+									name = key, mutation = mutation, traits = {},
+									tierName = rarity or (type(e) == "table" and e.Rarity) or nil,
+									mps = gen, exact = true, carpet = true,
+								})
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	table.sort(found, function(a, b) return a.mps > b.mps end)
+	return found
+end
+
+---------------------------------------------------------------- feed (Firebase) + Discord
+--[[
+	FEED_URL is a free Firebase Realtime Database (set up from your phone, no
+	server). Each server's finds go up as one batch; Infin AJ reads new batches
+	every ~1.5s and joins with the JobId. Old batches are cleaned up here.
+]]
+local Feed = { ok = nil, lastError = nil, posts = 0 }
+
+local function feedBase()
+	return (Config.FEED_URL:gsub("%s", ""):gsub("/+$", ""))
+end
+
+local function feedUrl(path, query, base)
+	local q = query or ""
+	if Config.FEED_AUTH ~= "" and not base then q ..= (q == "" and "?" or "&") .. "auth=" .. HttpService:UrlEncode(Config.FEED_AUTH) end
+	return (base or feedBase()) .. path .. q
+end
+-- every database that gets the logs (main US one + websockets)
+local function batchBases()
+	local out = { false } -- false = the main feed
+	local eu = (Config.EU_FEED or ""):gsub("%s", ""):gsub("/+$", "")
+	if eu:find("^https://") then table.insert(out, eu) end
+	return out
+end
+
+-- Firebase push keys start with the time, so "older than X" is a key range
+local PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+local function keyForTime(ms)
+	local out = {}
+	for i = 8, 1, -1 do
+		local idx = ms % 64
+		out[i] = PUSH_CHARS:sub(idx + 1, idx + 1)
+		ms = math.floor(ms / 64)
+	end
+	return table.concat(out)
+end
+
+local function prune(base)
+	base = base or nil
+	local cutoff = keyForTime((os.time() - 600) * 1000) -- older than 10 minutes
+	local q = ('?orderBy=%s&endAt=%s&limitToFirst=100'):format(
+		HttpService:UrlEncode('"$key"'), HttpService:UrlEncode('"' .. cutoff .. '"'))
+	local res = request({ Url = feedUrl("/batches.json", q, base), Method = "GET" })
+	if not res or res.StatusCode ~= 200 then return end
+	local ok, old = pcall(HttpService.JSONDecode, HttpService, res.Body)
+	if not ok or type(old) ~= "table" then return end
+	local parts = {}
+	for k in pairs(old) do table.insert(parts, ('"%s":null'):format(k)) end
+	if #parts == 0 then return end
+	request({
+		Url = feedUrl("/batches.json", nil, base), Method = "PATCH",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = "{" .. table.concat(parts, ",") .. "}",
+	})
+end
+
+-- country -> websocket region (Roblox puts players in servers near them)
+local WS_REGION = {}
+for _, c in ipairs({ "US", "CA", "MX", "PR", "GT", "CR", "PA", "DO", "JM", "HN", "SV", "NI", "CU", "BS", "TT" }) do WS_REGION[c] = "NA" end
+for _, c in ipairs({ "GB", "IE", "FR", "DE", "NL", "BE", "LU", "ES", "PT", "IT", "CH", "AT", "DK", "SE", "NO", "FI", "IS",
+	"PL", "CZ", "SK", "HU", "RO", "BG", "GR", "HR", "SI", "RS", "BA", "LT", "LV", "EE", "UA", "BY", "RU", "TR", "CY", "MT",
+	"MA", "DZ", "TN", "EG", "ZA", "NG", "KE" }) do WS_REGION[c] = "EU" end
+for _, c in ipairs({ "BR", "AR", "CL", "CO", "PE", "VE", "UY", "PY", "BO", "EC" }) do WS_REGION[c] = "SA" end
+for _, c in ipairs({ "JP", "KR", "CN", "TW", "HK", "MO", "SG", "MY", "TH", "VN", "PH", "ID", "IN", "PK", "BD", "LK",
+	"AE", "SA", "QA", "KW", "IL", "JO", "KZ" }) do WS_REGION[c] = "ASIA" end
+for _, c in ipairs({ "AU", "NZ", "FJ", "PG" }) do WS_REGION[c] = "OCE" end
+local myRegion
+local function finderRegion()
+	if myRegion then return myRegion end
+	local ok, code = pcall(function()
+		return game:GetService("LocalizationService"):GetCountryRegionForPlayerAsync(player)
+	end)
+	code = ok and type(code) == "string" and code:upper() or "US"
+	myRegion = { country = code, region = WS_REGION[code] or "NA" }
+	return myRegion
+end
+
+function Feed.post(list)
+	if #list == 0 then return true end
+	if feedBase() == "" or not feedBase():find("^https://") then
+		Feed.ok, Feed.lastError = false, "set your FEED URL"
+		return false
+	end
+	local finds = {}
+	for _, f in ipairs(list) do
+		table.insert(finds, {
+			name = f.name, mutation = f.mutation, traits = f.traits, tierName = f.tierName,
+			mps = f.mps, exact = f.exact, owner = f.owner, carpet = f.carpet or nil,
+		})
+	end
+	local body = HttpService:JSONEncode({
+			at = os.time(),
+			jobId = game.JobId,
+			placeId = game.PlaceId,
+			players = #Players:GetPlayers(),
+			maxPlayers = Players.MaxPlayers,
+			finder = player.Name,
+			region = finderRegion().region, country = finderRegion().country,
+			finds = finds,
+		})
+	-- the extra websockets get the same log at the same time
+	local bases = batchBases()
+	for i = 2, #bases do
+		task.spawn(request, { Url = feedUrl("/batches.json", nil, bases[i]), Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" }, Body = body })
+	end
+	local res, err = request({
+		Url = feedUrl("/batches.json"), Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" }, Body = body,
+	})
+	Feed.ok = res ~= nil and res.StatusCode == 200
+	Feed.lastError = res and (res.StatusCode ~= 200 and ("database said " .. res.StatusCode
+		.. (res.StatusCode == 401 and " (check your rules)" or ""))) or err
+	if Feed.ok then
+		Feed.posts += 1
+		if Feed.posts % 8 == 1 then
+			for _, b in ipairs(bases) do task.spawn(prune, b or nil) end
+		end
+	end
+	return Feed.ok
+end
+
+--[[
+	CLAIMS (bots working together)
+	Every bot writes the server it's in (and the one it's about to join) to
+	/claims, and skips anything another bot claimed in the last 30 minutes.
+	Two bots never waste a hop on the same server.
+]]
+local Claims = { set = {}, loadedAt = 0 }
+function Claims.claim(id)
+	if feedBase() == "" or type(id) ~= "string" or id == "" then return end
+	Claims.set[id] = true
+	task.spawn(request, {
+		Url = feedUrl("/claims/" .. id .. ".json"), Method = "PUT",
+		Headers = { ["Content-Type"] = "application/json" }, Body = tostring(os.time()),
+	})
+end
+function Claims.load()
+	if feedBase() == "" then return end
+	local res = request({ Url = feedUrl("/claims.json"), Method = "GET" })
+	if not res or res.StatusCode ~= 200 then return end
+	local ok, d = pcall(HttpService.JSONDecode, HttpService, res.Body)
+	if not ok or type(d) ~= "table" then return end
+	local now, old = os.time(), {}
+	for id, t in pairs(d) do
+		if now - (tonumber(t) or 0) < 1800 then Claims.set[id] = true else table.insert(old, ('"%s":null'):format(id)) end
+	end
+	Claims.loadedAt = os.clock()
+	-- tidy up old claims now and then
+	if #old > 20 then
+		task.spawn(request, {
+			Url = feedUrl("/claims.json"), Method = "PATCH",
+			Headers = { ["Content-Type"] = "application/json" }, Body = "{" .. table.concat(old, ",", 1, math.min(#old, 300)) .. "}",
+		})
+	end
+end
+
+-- the brainrot's picture from the Fandom wiki (cached across hops)
+State.images = State.images or {}
+local WIKI = "https://stealabrainrot.fandom.com/api.php"
+local function wiki(params)
+	local parts = { "format=json", "formatversion=2" }
+	for k, v in pairs(params) do table.insert(parts, k .. "=" .. HttpService:UrlEncode(v)) end
+	local res = request({ Url = WIKI .. "?" .. table.concat(parts, "&"), Method = "GET",
+		Headers = { ["User-Agent"] = "InfinFinder/1.0" } })
+	if not res or res.StatusCode ~= 200 then return nil end
+	local ok, d = pcall(HttpService.JSONDecode, HttpService, res.Body)
+	return ok and d or nil
+end
+local function cleanImage(src)
+	if type(src) ~= "string" then return nil end
+	return (src:gsub("/scale%-to%-width%-down/%d+", ""))
+end
+local function pageImage(title)
+	local d = wiki({ action = "query", titles = title, prop = "pageimages", piprop = "original|thumbnail", pithumbsize = "400", redirects = "1" })
+	local page = d and d.query and d.query.pages and d.query.pages[1]
+	if not page or page.missing then return nil end
+	return cleanImage((page.original and page.original.source) or (page.thumbnail and page.thumbnail.source))
+end
+local function brainrotImage(name)
+	local cached = State.images[name]
+	if cached ~= nil then return cached ~= false and cached or nil end
+	local url = pageImage(name)
+	if not url then
+		local d = wiki({ action = "query", list = "search", srsearch = name, srlimit = "1", srnamespace = "0" })
+		local hit = d and d.query and d.query.search and d.query.search[1]
+		if hit then url = pageImage(hit.title) end
+	end
+	if not url then
+		local d = wiki({ action = "query", titles = "File:" .. name .. ".png", prop = "imageinfo", iiprop = "url" })
+		local page = d and d.query and d.query.pages and d.query.pages[1]
+		url = cleanImage(page and page.imageinfo and page.imageinfo[1] and page.imageinfo[1].url)
+	end
+	State.images[name] = url or false
+	saveState()
+	return url
+end
+
+--[[
+	DISCORD LOG
+	One message per server:
+	  • the message text is a short headline (shows in phone notifications)
+	  • a server card on top: best find, player count, Job ID, join line
+	  • one card per brainrot: wiki picture, big M/s, rarity, mutation, owner, traits
+	Colours follow the mutation (or rarity), icons use the Infin logo.
+]]
+local TIER_STYLE = {
+	OG = { "👑", 0xFF9632 }, Secret = { "🔮", 0xF4F4F6 }, ["Brainrot God"] = { "⚡", 0x5AE6FF },
+	Mythic = { "🔥", 0xFF505F }, Legendary = { "⭐", 0xFFC83C }, Epic = { "💜", 0xAF69FF },
+	Rare = { "💙", 0x5AA0FF }, Common = { "⚪", 0xAAAAB0 }, Exclusive = { "💗", 0xFF78DC },
+}
+local MUT_STYLE = {
+	gold = { "🟨", 0xD6A82E }, diamond = { "💎", 0x40C4E0 }, rainbow = { "🌈", 0x9648EC },
+	lava = { "🌋", 0xE25822 }, bloodrot = { "🩸", 0x961A28 }, candy = { "🍬", 0xEC6098 },
+	galaxy = { "🌌", 0x4E3EBE }, yinyang = { "☯️", 0xE2E2EC }, radioactive = { "☢️", 0x78DC28 },
+	phantom = { "👻", 0x3A1456 }, cyber = { "🤖", 0x3E9BFF }, cursed = { "💀", 0xC81A1A },
+	divine = { "😇", 0xFFD63E },
+}
+
+-- the game's mutation squares (same icons Infin AJ uses) + the Infin logo
+local LOGO_ID = 104658634765450
+local MUTATION_ICON_IDS = {
+	yinyang = 112996178302302, rainbow = 83078714090192, radioactive = 134809510446754,
+	phantom = 133429883380355, lava = 70800471498231, gold = 136133057822407,
+	galaxy = 139331671405138, divine = 117437279650650, diamond = 100875709547015,
+	cyber = 91596580591665, cursed = 139160534192980, candy = 84797673698685,
+	bloodrot = 75212036784031,
+}
+
+--[[
+	Discord can't show rbxassetid images, so turn each one into a web picture
+	with Roblox's thumbnail service (one request for all of them, cached across hops).
+]]
+local function webIcons()
+	if State.webIcons and State.webIcons.v == 2 then return State.webIcons end
+	local ids = { tostring(LOGO_ID) }
+	for _, id in pairs(MUTATION_ICON_IDS) do table.insert(ids, tostring(id)) end
+	local data = httpGetJSON(("https://thumbnails.roblox.com/v1/assets?assetIds=%s&returnPolicy=PlaceHolder&size=150x150&format=Png&isCircular=false")
+		:format(table.concat(ids, ",")))
+	local byId = {}
+	for _, t in ipairs(data and data.data or {}) do
+		if t.state == "Completed" and type(t.imageUrl) == "string" then byId[tonumber(t.targetId)] = t.imageUrl end
+	end
+	local icons = { v = 2, logo = byId[LOGO_ID], mutations = {} }
+	for name, id in pairs(MUTATION_ICON_IDS) do icons.mutations[name] = byId[id] end
+	-- only keep it once every icon came back (Roblox sometimes says "Pending" the first time)
+	local have = 0
+	for _ in pairs(icons.mutations) do have += 1 end
+	if icons.logo and have >= 13 then
+		State.webIcons = icons
+		saveState()
+	end
+	return icons
+end
+
+local function logoUrl() return webIcons().logo end
+local function mutationIcon(m) return m and webIcons().mutations[tostring(m):lower():gsub("[^%a]", "")] or nil end
+
+-- coloured squares for each mutation in the "Other" list (no square = normal)
+local MUT_SQUARE = {
+	gold = "🟨", diamond = "🟦", rainbow = "🌈", lava = "🟧", bloodrot = "🟥", candy = "🩷",
+	galaxy = "🟪", yinyang = "☯️", radioactive = "🟩", phantom = "⬛", cyber = "🔷", cursed = "🟥",
+	divine = "🟨",
+}
+--[[
+	YOUR SERVER'S MUTATION EMOJIS (the game's real blocks, small + inline)
+	Paste each emoji's ID next to its name. To get them all at once, send
+	this in any channel of your server and copy what Discord shows:
+	  \:emoji_1: \:emoji_2: \:emoji_3: ... \:emoji_16:
+	(each turns into <:emoji_1:1234567890123456789>). The whole <:...> or
+	just the number both work. Blank = falls back to a coloured square.
+]]
+local EMOJI_ID = {
+	emoji_1 = "1561460093042688110", emoji_2 = "1561460113259106425", emoji_3 = "1561460133693751507", emoji_4 = "1561460151213494282",
+	emoji_5 = "1561460201272516788", emoji_6 = "1561460231601393774", emoji_7 = "1561460262823792720", emoji_8 = "1561460302816747520",
+	emoji_9 = "1561460610066030602", emoji_10 = "1561460628932141136", emoji_11 = "1561461320803557426", emoji_12 = "1561461335320170556",
+	emoji_13 = "1561461366467067964", emoji_14 = "1561461506040799262", emoji_15 = "1561461670713360425", emoji_16 = "1561461792985583647",
+}
+-- which emoji is which mutation (from your emoji list)
+local MUT_TO_EMOJI = {
+	rainbow = "emoji_1", cyber = "emoji_2", galaxy = "emoji_3", diamond = "emoji_4", radioactive = "emoji_5",
+	yinyang = "emoji_6", gold = "emoji_7", normal = "emoji_8", eclipse = "emoji_9", crystal = "emoji_10", candy = "emoji_11",
+	cursed = "emoji_12", bloodrot = "emoji_13", phantom = "emoji_14", divine = "emoji_15",
+	lava = "emoji_16",
+}
+local function mutEmoji(m)
+	local k = m and tostring(m):lower():gsub("[^%a]", "") or "normal"
+	local name = MUT_TO_EMOJI[k]
+	local v = name and EMOJI_ID[name]
+	if v and v ~= "" then
+		if v:find("^<a?:") then return v end
+		local id = v:match("%d+")
+		if id then return ("<:%s:%s>"):format(name, id) end
+	end
+	if k == "normal" then return nil end -- no emoji yet: normal ones just show the name
+	return MUT_SQUARE[k] -- unknown mutation: no icon, its name is shown instead
+end
+-- the header category, picked from the best find's M/s
+local function category(mps)
+	if mps > 2e9 then return "Ultralights" elseif mps > 200e6 then return "Highlights"
+	elseif mps > 10e6 then return "Midlights" end
+	return "Lowlights"
+end
+
+--[[
+	One clean card per server (Discord's newer "container" layout):
+	  Infin • Ultralights
+	  ───────────────
+	  Best brainrot (big) + M/s + mutation/rarity        [picture]
+	  ───────────────
+	  Other: "1x 🟦 Name — $225M/s" lines, best first
+	  Server total, players, Job ID
+	  ───────────────
+	  discord.gg/infinhub | time
+	If the webhook refuses that layout, the same card goes out as a normal embed.
+]]
+-- posts to a webhook; if Discord says "slow down" (429) it waits what Discord asks and tries again
+local function postHook(url, body)
+	local res
+	for _ = 1, 3 do
+		res = request({ Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+		if not res or res.StatusCode ~= 429 then return res end
+		local ok, d = pcall(HttpService.JSONDecode, HttpService, res.Body or "")
+		local wait = ok and type(d) == "table" and tonumber(d.retry_after) or 1
+		task.wait(math.clamp(wait, 0.2, 3))
+	end
+	return res
+end
+
+local function sendCard(list, hook, forcedCat)
+	if not hook or hook == "" or #list == 0 then return end
+	list = table.clone(list)
+	table.sort(list, function(a, b) return a.mps > b.mps end) -- best first
+	local best = list[1]
+	local players, maxPlayers = #Players:GetPlayers(), Players.MaxPlayers
+	local now = os.time()
+	local tier = TIER_STYLE[tostring(best.tierName)] or { "✦", 0xAAAAB0 }
+	local mut = best.mutation and MUT_STYLE[tostring(best.mutation):lower()]
+	local color = (mut and mut[2]) or tier[2]
+	-- wiki picture, but never hold the log up for it (cached after the first time)
+	local img
+	if State.images[best.name] ~= nil then
+		img = brainrotImage(best.name)
+	else
+		local done
+		task.spawn(function() img = brainrotImage(best.name); done = true end)
+		local t0 = os.clock()
+		while not done and os.clock() - t0 < 0.6 do task.wait(0.03) end
+	end
+	img = img or mutationIcon(best.mutation)
+	local total = 0
+	for _, f in ipairs(list) do total += f.mps end
+
+	local cat = forcedCat or category(best.mps)
+	local CAT_ICON = { ["OG Logs"] = "👑", Ultralights = "💎", Highlights = "⚡", Midlights = "✨", Lowlights = "🌱" }
+	local count = #list
+	local D = Animals.Data and Animals.Data()
+	local info = D and type(D[best.name]) == "table" and D[best.name] or nil
+	local price = info and tonumber(info.Price) or 0
+	local function money(n) return (fmtMoney(n):gsub("/s$", "")) end
+
+	-- header
+	local header = table.concat({
+		("-# INFIN AJ  ·  PREMIUM LOGS"),
+		("## %s %s"):format(CAT_ICON[cat] or "✨", cat),
+	}, "\n")
+
+	-- the best find
+	local bl = {}
+	if best.carpet then table.insert(bl, "🟥 **ON THE CARPET**  ·  buy it before it walks off") end
+	local bestEmo = mutEmoji(best.mutation)
+	table.insert(bl, ("## %s%s"):format(bestEmo and (bestEmo .. " ") or "", best.name))
+	table.insert(bl, ("### 💸 %s%s"):format(best.exact and "" or "≈", fmtMoney(best.mps)))
+	local tags = {}
+	table.insert(tags, (bestEmo and (bestEmo .. " ") or "") .. "**" .. (best.mutation or "Normal") .. "**")
+	table.insert(tags, tier[1] .. " **" .. tostring(best.tierName or "Unknown") .. "**")
+	if price > 0 then table.insert(tags, "🪙 **" .. money(price) .. "**") end
+	table.insert(bl, table.concat(tags, "  ┃  "))
+	if best.owner then table.insert(bl, "-# 🏠 base of @" .. best.owner) end
+	local bestText = table.concat(bl, "\n")
+
+	-- "Other": stack duplicates as 2x, 3x...
+	local groups, order = {}, {}
+	for i = 2, #list do
+		local f = list[i]
+		local key = f.name .. "|" .. tostring(f.mutation) .. "|" .. f.mps .. "|" .. tostring(f.carpet)
+		if not groups[key] then
+			groups[key] = { f = f, n = 0 }
+			table.insert(order, key)
+		end
+		groups[key].n += 1
+	end
+	local other = {}
+	for i, key in ipairs(order) do
+		if i > 30 then
+			table.insert(other, ("-# …and %d more"):format(#order - 30))
+			break
+		end
+		local g = groups[key]
+		local emo = mutEmoji(g.f.mutation)
+		local unknownMut = g.f.mutation and not emo and (" *(" .. g.f.mutation .. ")*") or ""
+		table.insert(other, ("`%dx` %s%s%s — **%s**%s"):format(g.n, emo and (emo .. " ") or "", g.f.name, unknownMut,
+			fmtMoney(g.f.mps), g.f.carpet and "  🟥 carpet" or ""))
+	end
+	local otherText = #other > 0 and ("**OTHER BRAINROTS**\n" .. table.concat(other, "\n")) or nil
+
+	local statsText = ("💰 **%s** total  ┃  👥 **%d/%d**  ┃  🧠 **%d** brainrot%s"):format(
+		fmtMoney(total), players, maxPlayers, count, count == 1 and "" or "s")
+	local serverText = table.concat({
+		"**JOB ID**",
+		"```" .. game.JobId .. "```",
+		"-# 🚀 open **Infin AJ** to join this server instantly",
+	}, "\n")
+	local footer = ("-# Infin AJ  •  discord.gg/infinhub  •  <t:%d:f>  (<t:%d:R>)"):format(now, now)
+
+	local function section(text, url, alt)
+		return { type = 9, components = { { type = 10, content = text } },
+			accessory = { type = 11, media = { url = url }, description = alt } }
+	end
+	local logo = logoUrl()
+	local parts = {}
+	table.insert(parts, logo and section(header, logo, "Infin AJ") or { type = 10, content = header })
+	table.insert(parts, { type = 14, divider = true, spacing = 1 })
+	table.insert(parts, img and section(bestText, img, best.name) or { type = 10, content = bestText })
+	table.insert(parts, { type = 14, divider = true, spacing = 1 })
+	table.insert(parts, { type = 10, content = statsText })
+	if otherText then
+		table.insert(parts, { type = 14, divider = false, spacing = 1 })
+		table.insert(parts, { type = 10, content = otherText })
+	end
+	table.insert(parts, { type = 14, divider = true, spacing = 1 })
+	table.insert(parts, { type = 10, content = serverText })
+	table.insert(parts, { type = 10, content = footer })
+	local bestSquare = mutationIcon(best.mutation)
+
+	local icon = logoUrl()
+	local sep = hook:find("?", 1, true) and "&" or "?"
+	local res = postHook(hook .. sep .. "with_components=true", HttpService:JSONEncode({
+		username = "Infin Finder", avatar_url = icon,
+		flags = 32768,
+		components = { { type = 17, accent_color = color, components = parts } },
+		allowed_mentions = { parse = {} },
+	}))
+	if res and res.StatusCode and res.StatusCode < 300 then return end
+
+	-- fallback: the same card as a classic embed
+	local desc = { bestText, "", statsText }
+	if otherText then table.insert(desc, "\n" .. otherText) end
+	table.insert(desc, "\n" .. serverText)
+	postHook(hook, HttpService:JSONEncode({
+			username = "Infin Finder", avatar_url = icon,
+			embeds = { {
+				author = bestSquare and { name = string.upper(best.mutation) .. " MUTATION", icon_url = bestSquare } or nil,
+				title = ("%s %s  ·  Infin AJ"):format(CAT_ICON[cat] or "✨", cat),
+				description = table.concat(desc, "\n"),
+				color = color,
+				thumbnail = img and { url = img } or nil,
+				footer = { text = "discord.gg/infinhub", icon_url = icon },
+				timestamp = DateTime.now():ToIsoDate(),
+			} },
+			allowed_mentions = { parse = {} },
+		}))
+end
+
+-- every find goes to its own channel: OGs to the OG logs, the rest by M/s
+function Feed.discord(list)
+	if #list == 0 then return end
+	local buckets = { og = {}, low = {}, mid = {}, high = {}, ultra = {} }
+	for _, f in ipairs(list) do
+		if tostring(f.tierName) == "OG" then
+			table.insert(buckets.og, f)
+		elseif f.mps > 2e9 then
+			table.insert(buckets.ultra, f)
+		elseif f.mps > 200e6 then
+			table.insert(buckets.high, f)
+		elseif f.mps > 10e6 then
+			table.insert(buckets.mid, f)
+		else
+			table.insert(buckets.low, f)
+		end
+	end
+	local jobs = {
+		{ buckets.og, Config.OG_WEBHOOK, "OG Logs" },
+		{ buckets.ultra, Config.WEBHOOK, "Ultralights" },
+		{ buckets.high, Config.HIGH_WEBHOOK, "Highlights" },
+		{ buckets.mid, Config.MID_WEBHOOK, "Midlights" },
+		{ buckets.low, Config.LOW_WEBHOOK, "Lowlights" },
+	}
+	-- all channels send at the same time
+	local left = 0
+	for _, j in ipairs(jobs) do
+		if #j[1] > 0 and j[2] ~= "" then
+			left += 1
+			task.spawn(function()
+				pcall(sendCard, j[1], j[2], j[3])
+				left -= 1
+			end)
+		end
+	end
+	local t0 = os.clock()
+	while left > 0 and os.clock() - t0 < 4 do task.wait(0.05) end
+end
+
+--[[
+	STEAL LOGS
+	Infin AJ users report a steal to /steals in the feed (the AJ never has
+	your webhook). Your Finder bots pick each one up, claim it so the two
+	bots never double-post, and send a steal card that pings the thief's
+	Discord: brainrot picture, mutation block, M/s, worth, who it came from.
+]]
+local Steals = {}
+local function avatarUrl(userId)
+	if type(userId) ~= "number" then return nil end
+	local d = httpGetJSON(("https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=%d&size=150x150&format=Png&isCircular=false"):format(userId))
+	local t = d and d.data and d.data[1]
+	return (t and t.state == "Completed") and t.imageUrl or nil
+end
+
+function Steals.post(st)
+	local hook = Config.STEAL_WEBHOOK ~= "" and Config.STEAL_WEBHOOK or hook
+	if hook == "" then return false end
+	local mps = tonumber(st.mps) or 0
+	local mutKey = st.mutation and tostring(st.mutation):lower()
+	local mut = mutKey and MUT_STYLE[mutKey]
+	local tier = TIER_STYLE[tostring(st.tierName)] or { "✦", 0xAAAAB0 }
+	local color = (mut and mut[2]) or tier[2]
+	local img = brainrotImage(tostring(st.name))
+	local square = mutationIcon(st.mutation)
+	local face = avatarUrl(tonumber(st.thiefId))
+	local who = ("**%s** (@%s)"):format(tostring(st.thiefDisplay or st.thief), tostring(st.thief))
+	local worth = tonumber(st.price) or 0
+	local now = os.time()
+
+	local headline = ("%s stole **%s**!"):format(who, tostring(st.name))
+	local bestLines = {
+		"## " .. (st.mutation and ((mutEmoji(st.mutation) or "🧬") .. " ") or "") .. tostring(st.name),
+		("### 💸 %s"):format(fmtMoney(mps)),
+		tier[1] .. " " .. tostring(st.tierName or "Unknown") .. (worth > 0 and ("  ·  💰 worth **$" .. (fmtMoney(worth):gsub("^%$", ""):gsub("/s$", "")) .. "**") or ""),
+	}
+	local thiefLines = {
+		"**Stolen by**",
+		who,
+		st.victim and ("-# taken from @" .. tostring(st.victim) .. "'s base") or "-# taken from another base",
+	}
+	local function section(text, url, alt)
+		return { type = 9, components = { { type = 10, content = text } },
+			accessory = { type = 11, media = { url = url }, description = alt } }
+	end
+	local parts = {
+		{ type = 10, content = "-# INFIN AJ  ·  PREMIUM LOGS\n## 🚨 Steal Log" },
+		{ type = 10, content = headline },
+		{ type = 14, divider = true, spacing = 1 },
+	}
+	local bestText = table.concat(bestLines, "\n")
+	table.insert(parts, img and section(bestText, img, tostring(st.name)) or { type = 10, content = bestText })
+	if st.mutation then
+		table.insert(parts, { type = 10, content = (mutEmoji(st.mutation) or "🧬") .. " **" .. tostring(st.mutation) .. "** mutation" })
+	end
+	table.insert(parts, { type = 14, divider = true, spacing = 1 })
+	local thiefText = table.concat(thiefLines, "\n")
+	table.insert(parts, face and section(thiefText, face, tostring(st.thief)) or { type = 10, content = thiefText })
+	table.insert(parts, { type = 14, divider = true, spacing = 1 })
+	table.insert(parts, { type = 10, content = ("-# Infin AJ · discord.gg/infinhub | <t:%d:f>"):format(tonumber(st.at) or now) })
+
+	local mentions = { parse = {} }
+	local icon = logoUrl()
+	local sep = hook:find("?", 1, true) and "&" or "?"
+	local res = request({
+		Url = hook .. sep .. "with_components=true", Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = HttpService:JSONEncode({
+			username = "Infin AJ", avatar_url = icon, flags = 32768,
+			components = { { type = 17, accent_color = color, components = parts } },
+			allowed_mentions = mentions,
+		}),
+	})
+	if res and res.StatusCode and res.StatusCode < 300 then return true end
+	-- fallback: classic embed (the ping goes in the message text)
+	res = request({
+		Url = hook, Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = HttpService:JSONEncode({
+			username = "Infin AJ", avatar_url = icon,
+			content = headline,
+			embeds = { {
+				author = square and { name = string.upper(tostring(st.mutation)) .. " MUTATION", icon_url = square } or nil,
+				title = "🚨 Steal Log",
+				description = bestText .. "\n\n" .. thiefText,
+				color = color,
+				thumbnail = (img or face) and { url = img or face } or nil,
+				footer = { text = "Infin AJ · discord.gg/infinhub", icon_url = face or icon },
+				timestamp = DateTime.now():ToIsoDate(),
+			} },
+			allowed_mentions = mentions,
+		}),
+	})
+	return res ~= nil and res.StatusCode ~= nil and res.StatusCode < 300
+end
+
+-- pick up new steals from the feed (runs in the background on every server)
+function Steals.relay()
+	if feedBase() == "" or (Config.STEAL_WEBHOOK == "" and Config.WEBHOOK == "") then return end
+	local res = request({ Url = feedUrl("/steals.json", "?orderBy=" .. HttpService:UrlEncode('"$key"') .. "&limitToLast=15"), Method = "GET" })
+	if not res or res.StatusCode ~= 200 then return end
+	local ok, d = pcall(HttpService.JSONDecode, HttpService, res.Body)
+	if not ok or type(d) ~= "table" then return end
+	local me = player.Name
+	local keys = {}
+	for k, st in pairs(d) do
+		-- unsent, and not claimed in the last 20s (a bot that hopped mid-send gets retried)
+		local claim = type(st) == "table" and st.claim
+		local fresh = type(claim) == "table" and os.time() - (tonumber(claim.t) or 0) < 20
+		if type(st) == "table" and not st.sent and not fresh and os.time() - (tonumber(st.at) or 0) < 900 then table.insert(keys, k) end
+	end
+	table.sort(keys)
+	for _, k in ipairs(keys) do
+		-- claim it, then check we won the claim (the other bot may have grabbed it)
+		local tag = me .. ":" .. HttpService:GenerateGUID(false):sub(1, 8)
+		request({ Url = feedUrl("/steals/" .. k .. "/claim.json"), Method = "PUT",
+			Headers = { ["Content-Type"] = "application/json" }, Body = HttpService:JSONEncode({ by = tag, t = os.time() }) })
+		task.wait(0.35)
+		local chk = request({ Url = feedUrl("/steals/" .. k .. "/claim/by.json"), Method = "GET" })
+		local okc, owner = pcall(HttpService.JSONDecode, HttpService, chk and chk.Body or "null")
+		if okc and owner == tag then
+			local okp, sent = pcall(Steals.post, d[k])
+			if okp and sent then
+				request({ Url = feedUrl("/steals/" .. k .. "/sent.json"), Method = "PUT",
+					Headers = { ["Content-Type"] = "application/json" }, Body = "true" })
+			end
+		end
+	end
+	-- tidy: drop steals older than a day
+	local old = {}
+	for k, st in pairs(d) do
+		if type(st) == "table" and os.time() - (tonumber(st.at) or 0) > 86400 then table.insert(old, ('"%s":null'):format(k)) end
+	end
+	if #old > 0 then
+		request({ Url = feedUrl("/steals.json"), Method = "PATCH", Headers = { ["Content-Type"] = "application/json" },
+			Body = "{" .. table.concat(old, ",") .. "}" })
+	end
+end
+
+--[[
+	STATUS CHANNEL + HEARTBEAT
+	Every bot writes a heartbeat to /finders so Infin AJ can show ONLINE /
+	OFFLINE. With BOT_TOKEN + STATUS_CHANNEL set, the voice channel is renamed
+	to ONLINE_NAME while bots run, and OFFLINE_NAME when the last bot stops
+	(turn AUTO HOP off). Discord only allows 2 renames per 10 minutes per
+	channel, so changes are spaced out and retried on the next server.
+]]
+local Status = {}
+function Status.beat()
+	if feedBase() == "" then return end
+	request({
+		Url = feedUrl("/finders/" .. player.UserId .. ".json"), Method = "PUT",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = HttpService:JSONEncode({ name = player.Name, at = { [".sv"] = "timestamp" }, hopping = Config.AUTO_HOP }),
+	})
+end
+-- other bots still running? (heartbeat in the last 90s)
+function Status.othersAlive()
+	local res = request({ Url = feedUrl("/finders.json"), Method = "GET" })
+	if not res or res.StatusCode ~= 200 then return false end
+	local ok, d = pcall(HttpService.JSONDecode, HttpService, res.Body)
+	if not ok or type(d) ~= "table" then return false end
+	-- compare against the newest heartbeat (ours, just written) so device clocks don't matter
+	local nowMs = 0
+	for _, f in pairs(d) do if type(f) == "table" then nowMs = math.max(nowMs, tonumber(f.at) or 0) end end
+	for id, f in pairs(d) do
+		if tostring(id) ~= tostring(player.UserId) and type(f) == "table" and f.hopping ~= false
+			and nowMs - (tonumber(f.at) or 0) < 90000 then return true end
+	end
+	return false
+end
+--[[
+	One switch for everything: saves the state to /status (every Infin AJ
+	copies it onto its status pill) and, with a bot token, renames the voice
+	channel to match. The AJ part needs no token.
+]]
+function Status.setChannel(online)
+	if feedBase() == "" then return end
+	local want = online and "online" or "offline"
+	local cur = request({ Url = feedUrl("/status.json"), Method = "GET" })
+	local okc, st = pcall(HttpService.JSONDecode, HttpService, cur and cur.Body or "null")
+	st = okc and type(st) == "table" and st or {}
+	-- 1) the AJs: instant, no limits
+	if st.state ~= want then
+		request({
+			Url = feedUrl("/status.json"), Method = "PATCH", Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode({ state = want, at = { [".sv"] = "timestamp" }, by = player.Name }),
+		})
+	end
+	-- 2) the voice channel: only with a bot token, and Discord allows 2 renames per 10 minutes
+	if Config.BOT_TOKEN == "" or Config.STATUS_CHANNEL == "" then return end
+	if st.channel == want then return end
+	if os.time() - (tonumber(st.renamedAt) or 0) < 300 then return end -- next server retries
+	local res = request({
+		Url = "https://discord.com/api/v10/channels/" .. Config.STATUS_CHANNEL:match("%d+"), Method = "PATCH",
+		Headers = { ["Content-Type"] = "application/json", ["Authorization"] = "Bot " .. Config.BOT_TOKEN },
+		Body = HttpService:JSONEncode({ name = online and Config.ONLINE_NAME or Config.OFFLINE_NAME }),
+	})
+	if res and res.StatusCode and res.StatusCode < 300 then
+		request({
+			Url = feedUrl("/status.json"), Method = "PATCH", Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode({ channel = want, renamedAt = os.time() }),
+		})
+	elseif res then
+		warn("[Infin Finder] couldn't rename the status channel (" .. tostring(res.StatusCode) .. "): " .. tostring(res.Body):sub(1, 120))
+	end
+end
+
+---------------------------------------------------------------- hopper
+local Hopper = { busy = false, fetching = false, status = "idle", list = nil }
+
+local function loaderCode()
+	if Config.LOADER ~= "" then return Config.LOADER end
+	if canFS and typeof(isfile) == "function" and isfile(Config.SCRIPT_FILE) then
+		return ("loadstring(readfile(%q))()"):format(Config.SCRIPT_FILE)
+	end
+	return nil
+end
+
+-- lines up fresh servers (called while the bases load, so leaving is instant)
+function Hopper.fetch()
+	if Hopper.fetching then
+		while Hopper.fetching do task.wait(0.1) end
+		return Hopper.list
+	end
+	Hopper.fetching = true
+	local preferred, backup = {}, {}
+	Hopper.source = nil
+
+	local function getPage(host, cursor)
+		-- two bots read the list from opposite ends, so they spread out
+		local order = (player.UserId % 2 == 0) and "Desc" or "Asc"
+		local url = ("https://%s/v1/games/%d/servers/Public?sortOrder=%s&limit=100&excludeFullGames=true"):format(host, game.PlaceId, order)
+		if cursor and cursor ~= "" then url ..= "&cursor=" .. HttpService:UrlEncode(cursor) end
+		-- game:HttpGet first (works on most executors), then request()
+		local ok, body = pcall(function() return game:HttpGet(url) end)
+		if ok and type(body) == "string" then
+			local ok2, data = pcall(HttpService.JSONDecode, HttpService, body)
+			if ok2 and type(data) == "table" and data.data then return data end
+		end
+		return (httpGetJSON(url))
+	end
+
+	for _, host in ipairs({ "games.roblox.com", "games.roproxy.com" }) do
+		local cursor
+		for _ = 1, 10 do
+			local data = getPage(host, cursor)
+			if not data then break end
+			Hopper.source = host:match("^games%.(%a+)")
+			for _, sv in ipairs(data.data or {}) do
+				local playing, max = tonumber(sv.playing) or 0, tonumber(sv.maxPlayers) or 0
+				if type(sv.id) == "string" and sv.id ~= game.JobId and not State.visited[sv.id]
+					and not Logged[sv.id] and not Claims.set[sv.id] and playing < max then
+					table.insert(playing >= Config.MIN_PLAYERS and preferred or backup, sv.id)
+				end
+			end
+			cursor = data.nextPageCursor
+			if #preferred >= 40 or not cursor then break end
+		end
+		if Hopper.source then break end
+	end
+
+	-- busier servers first (more brainrots), quieter ones as backup
+	local function shuffle(t)
+		for i = #t, 2, -1 do
+			local j = math.random(i)
+			t[i], t[j] = t[j], t[i]
+		end
+	end
+	shuffle(preferred)
+	shuffle(backup)
+	for _, id in ipairs(backup) do table.insert(preferred, id) end
+	Hopper.list = preferred
+	Hopper.fetching = false
+	return preferred
+end
+
+-- everything the next server needs to know, carried by the teleport itself
+local function handover(rest)
+	local list = {}
+	for id, t in pairs(State.visited) do table.insert(list, { id, tonumber(t) or 0 }) end
+	table.sort(list, function(a, b) return a[2] > b[2] end)
+	local ids = {}
+	for i = 1, math.min(80, #list) do ids[i] = list[i][1] end
+	local queue = {}
+	for i = 1, math.min(60, rest and #rest or 0) do queue[i] = rest[i] end
+	return { infin = true, from = game.JobId, visited = ids, servers = State.servers, posted = State.posted, queue = queue }
+end
+
+-- tries one server; returns true only if the teleport actually started
+local function tryServer(id, rest)
+	local state = "wait"
+	local c1 = player.OnTeleport:Connect(function(st)
+		if st == Enum.TeleportState.Failed then
+			state = "failed"
+		elseif state == "wait" and (st == Enum.TeleportState.Started or st == Enum.TeleportState.InProgress
+			or st == Enum.TeleportState.WaitingForServer) then
+			state = "started"
+		end
+	end)
+	local c2 = TeleportService.TeleportInitFailed:Connect(function(plr, _, msg)
+		if plr == player then
+			state = "failed"
+			Hopper.lastError = tostring(msg)
+		end
+	end)
+	local ok, err
+	if id then
+		ok, err = pcall(TeleportService.TeleportToPlaceInstance, TeleportService, game.PlaceId, id, player, "", handover(rest))
+	else
+		-- no server list: let Roblox pick a random server (almost always a different one)
+		ok, err = pcall(TeleportService.Teleport, TeleportService, game.PlaceId, player, handover())
+	end
+	if not ok then
+		state = "failed"
+		Hopper.lastError = tostring(err)
+	end
+	-- a server that's full / gone fails within a second or two: move straight on
+	local t0 = os.clock()
+	while state == "wait" and os.clock() - t0 < 2 do task.wait(0.05) end
+	if state == "started" then
+		-- on its way: a good teleport ends this script, so we only get past here if it stalls
+		t0 = os.clock()
+		while state ~= "failed" and os.clock() - t0 < 12 do task.wait(0.1) end
+	end
+	c1:Disconnect()
+	c2:Disconnect()
+	return false
+end
+
+function Hopper.hop()
+	if Hopper.busy then return end
+	Hopper.busy = true
+	local code = loaderCode()
+	if code and queueTeleport then pcall(queueTeleport, code) end
+
+	for _ = 1, 4 do
+		local list = Hopper.list
+		Hopper.list = nil
+		if not list or #list == 0 then
+			Hopper.status = "finding a server..."
+			list = Hopper.fetch()
+			Hopper.list = nil
+		end
+		local tried = 0
+		list = list or {}
+		for i, id in ipairs(list) do
+			-- a different JobId every time: never this server, never one we've (or the other bot has) been to
+			if id ~= game.JobId and not State.visited[id] and not Claims.set[id] then
+				tried += 1
+				State.visited[id] = os.time()
+				saveState()
+				Claims.claim(id)
+				local rest = {}
+				for j = i + 1, #list do
+					if not State.visited[list[j]] and not Claims.set[list[j]] then table.insert(rest, list[j]) end
+				end
+				Hopper.status = ("leaving → new server (%d) · %d queued"):format(tried, #rest)
+				tryServer(id, rest)
+			end
+		end
+		if tried == 0 then
+			-- server list blocked everywhere: random server (if Roblox sends us back here,
+			-- the next run notices and hops straight away)
+			Hopper.status = Hopper.source and "every listed server visited, random hop" or "server list blocked, random hop"
+			tryServer(nil)
+		end
+	end
+	Hopper.status = "hop failed: " .. tostring(Hopper.lastError or "retrying")
+	Hopper.busy = false
+end
+
+---------------------------------------------------------------- gui
+local C = {
+	BG = Color3.fromRGB(6, 6, 7), Card = Color3.fromRGB(17, 17, 19), Card2 = Color3.fromRGB(25, 25, 28),
+	Stroke = Color3.fromRGB(36, 36, 40), Text = Color3.fromRGB(244, 244, 246), Sub = Color3.fromRGB(128, 128, 136),
+	Dim = Color3.fromRGB(74, 74, 80), White = Color3.fromRGB(255, 255, 255), Black = Color3.fromRGB(8, 8, 10),
+	Green = Color3.fromRGB(90, 210, 125), Red = Color3.fromRGB(230, 72, 82), Gold = Color3.fromRGB(240, 190, 70),
+}
+local FONT, FONT_B, FONT_X = Enum.Font.Gotham, Enum.Font.GothamBold, Enum.Font.GothamBlack
+local LOGO = "rbxassetid://104658634765450"
+
+local function create(class, props)
+	local o = Instance.new(class)
+	for k, v in pairs(props or {}) do if k ~= "Parent" then o[k] = v end end
+	if props and props.Parent then o.Parent = props.Parent end
+	return o
+end
+local function corner(p, r, full) return create("UICorner", { CornerRadius = full and UDim.new(1, 0) or UDim.new(0, r or 8), Parent = p }) end
+local function stroke(p, col, th, tr) return create("UIStroke", { Color = col or C.Stroke, Thickness = th or 1, Transparency = tr or 0, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = p }) end
+local function tween(o, t, props, style)
+	local tw = TweenService:Create(o, TweenInfo.new(t, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+
+local old = PlayerGui:FindFirstChild("InfinFinder")
+if old then old:Destroy() end
+
+local W, H = 330, 504
+local Gui = create("ScreenGui", { Name = "InfinFinder", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 998, Parent = PlayerGui })
+local Main = create("Frame", {
+	AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -16, 0.5, 0), Size = UDim2.fromOffset(W, H),
+	BackgroundColor3 = C.BG, ClipsDescendants = true, Parent = Gui,
+})
+corner(Main, 16)
+local border = stroke(Main, C.White, 1.5)
+local borderGrad = create("UIGradient", {
+	Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, C.Stroke), ColorSequenceKeypoint.new(0.45, C.Stroke),
+		ColorSequenceKeypoint.new(0.5, C.White), ColorSequenceKeypoint.new(0.55, C.Stroke), ColorSequenceKeypoint.new(1, C.Stroke),
+	}),
+	Parent = border,
+})
+local Scale = create("UIScale", { Parent = Main })
+do
+	local cam = workspace.CurrentCamera
+	local function fit()
+		local vp = cam.ViewportSize
+		Scale.Scale = math.clamp(math.min((vp.X - 20) / W, (vp.Y - 20) / H), 0.5, 1)
+	end
+	fit()
+	cam:GetPropertyChangedSignal("ViewportSize"):Connect(fit)
+end
+RunService.Heartbeat:Connect(function(dt) borderGrad.Rotation = (borderGrad.Rotation + dt * 60) % 360 end)
+
+-- header
+local Header = create("Frame", { Size = UDim2.new(1, 0, 0, 52), BackgroundTransparency = 1, Parent = Main })
+local logo = create("ImageLabel", {
+	AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 14, 0.5, 0), Size = UDim2.fromOffset(30, 30),
+	BackgroundColor3 = C.Card2, Image = LOGO, ScaleType = Enum.ScaleType.Crop, Parent = Header,
+})
+corner(logo, 0, true)
+
+create("TextLabel", {
+	Position = UDim2.fromOffset(54, 9), Size = UDim2.fromOffset(180, 18), BackgroundTransparency = 1,
+	Font = FONT_X, Text = "INFIN FINDER", TextSize = 15, TextColor3 = C.White, TextXAlignment = Enum.TextXAlignment.Left, Parent = Header,
+})
+local StatusLbl = create("TextLabel", {
+	Position = UDim2.fromOffset(54, 28), Size = UDim2.new(1, -110, 0, 14), BackgroundTransparency = 1,
+	Font = FONT_B, RichText = true, Text = "starting…", TextSize = 10, TextColor3 = C.Sub,
+	TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = Header,
+})
+local MinBtn = create("TextButton", {
+	AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(28, 28),
+	BackgroundColor3 = C.Card2, Font = FONT_B, Text = "—", TextSize = 14, TextColor3 = C.Text, Parent = Header,
+})
+corner(MinBtn, 0, true)
+
+local Body = create("Frame", { Position = UDim2.fromOffset(12, 56), Size = UDim2.new(1, -24, 1, -68), BackgroundTransparency = 1, Parent = Main })
+
+-- stats
+local function stat(x, label)
+	local f = create("Frame", { Position = UDim2.new(x, x == 0 and 0 or 3, 0, 0), Size = UDim2.new(1 / 3, -4, 0, 46), BackgroundColor3 = C.Card, Parent = Body })
+	corner(f, 10)
+	stroke(f)
+	create("TextLabel", {
+		Position = UDim2.fromOffset(10, 6), Size = UDim2.new(1, -14, 0, 12), BackgroundTransparency = 1, Font = FONT_B,
+		Text = label, TextSize = 9, TextColor3 = C.Sub, TextXAlignment = Enum.TextXAlignment.Left, Parent = f,
+	})
+	return create("TextLabel", {
+		Position = UDim2.fromOffset(10, 19), Size = UDim2.new(1, -14, 0, 20), BackgroundTransparency = 1, Font = FONT_X,
+		Text = "0", TextSize = 16, TextColor3 = C.Text, TextXAlignment = Enum.TextXAlignment.Left, Parent = f,
+	})
+end
+local ServersVal = stat(0, "SERVERS")
+local PostedVal  = stat(1 / 3, "POSTED")
+local HereVal    = stat(2 / 3, "THIS SERVER")
+
+-- buttons
+local function button(x, w, text, bg, fg)
+	local b = create("TextButton", {
+		Position = UDim2.new(x, x == 0 and 0 or 3, 0, 54), Size = UDim2.new(w, -4, 0, 36), BackgroundColor3 = bg,
+		Font = FONT_X, Text = text, TextSize = 11, TextColor3 = fg, AutoButtonColor = false, Parent = Body,
+	})
+	corner(b, 10)
+	stroke(b)
+	local sc = create("UIScale", { Parent = b })
+	b.MouseButton1Down:Connect(function() tween(sc, 0.08, { Scale = 0.94 }) end)
+	b.MouseButton1Up:Connect(function() tween(sc, 0.25, { Scale = 1 }, Enum.EasingStyle.Back) end)
+	b.MouseLeave:Connect(function() tween(sc, 0.15, { Scale = 1 }) end)
+	return b
+end
+local HopToggle = button(0, 1 / 3, "", C.Card, C.Text)
+local ScanBtn   = button(1 / 3, 1 / 3, "SCAN NOW", C.Card, C.Text)
+local HopBtn    = button(2 / 3, 1 / 3, "HOP NOW", C.White, C.Black)
+HopToggle.RichText = true
+local function paintHop()
+	HopToggle.Text = "AUTO HOP " .. (Config.AUTO_HOP and '<font color="#5ad27d">ON</font>' or '<font color="#e64852">OFF</font>')
+end
+paintHop()
+
+-- config fields
+local function field(y, label, key, isNumber)
+	local f = create("Frame", { Position = UDim2.fromOffset(0, y), Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.Card, Parent = Body })
+	corner(f, 8)
+	local st = stroke(f)
+	create("TextLabel", {
+		Position = UDim2.fromOffset(10, 0), Size = UDim2.fromOffset(78, 30), BackgroundTransparency = 1, Font = FONT_X,
+		Text = label, TextSize = 9, TextColor3 = C.Sub, TextXAlignment = Enum.TextXAlignment.Left, Parent = f,
+	})
+	local box = create("TextBox", {
+		Position = UDim2.fromOffset(88, 0), Size = UDim2.new(1, -96, 1, 0), BackgroundTransparency = 1, Font = FONT_B,
+		Text = isNumber and fmtMoney(Config[key]) or tostring(Config[key]), TextSize = 11, TextColor3 = C.Text,
+		TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ClipsDescendants = true, Parent = f,
+	})
+	box.Focused:Connect(function() tween(st, 0.2, { Color = C.Sub }) end)
+	box.FocusLost:Connect(function()
+		tween(st, 0.2, { Color = C.Stroke })
+		if isNumber then
+			Config[key] = parseMoney(box.Text)
+			box.Text = fmtMoney(Config[key])
+		else
+			Config[key] = (box.Text:gsub("%s+$", ""):gsub("/$", ""))
+			box.Text = Config[key]
+		end
+		saveConfig()
+	end)
+end
+field(98, "MIN M/S", "MIN_LOG", true)
+-- connection status (no links shown, safe to share)
+local function statusRow(y, label)
+	local f = create("Frame", { Position = UDim2.fromOffset(0, y), Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.Card, Parent = Body })
+	corner(f, 8)
+	stroke(f)
+	create("TextLabel", {
+		Position = UDim2.fromOffset(10, 0), Size = UDim2.fromOffset(78, 30), BackgroundTransparency = 1, Font = FONT_X,
+		Text = label, TextSize = 9, TextColor3 = C.Sub, TextXAlignment = Enum.TextXAlignment.Left, Parent = f,
+	})
+	local dot = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 88, 0.5, 0), Size = UDim2.fromOffset(7, 7),
+		BackgroundColor3 = C.Gold, Parent = f,
+	})
+	corner(dot, 0, true)
+	local txt = create("TextLabel", {
+		Position = UDim2.fromOffset(102, 0), Size = UDim2.new(1, -110, 1, 0), BackgroundTransparency = 1, Font = FONT_B,
+		Text = "checking…", TextSize = 11, TextColor3 = C.Text, TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd, Parent = f,
+	})
+	return function(text, col) txt.Text = text; dot.BackgroundColor3 = col end
+end
+local setFeedRow = statusRow(132, "FEED")
+local setHookRow = statusRow(166, "DISCORD")
+local setHopRow  = statusRow(200, "FINDER")
+task.spawn(function()
+	while Gui.Parent do
+		local eu = (Config.EU_FEED or ""):find("^https://") ~= nil
+		local regions = eu and "US + EU" or "US"
+		if Feed.ok == true then setFeedRow("connected · " .. regions, C.Green)
+		elseif Feed.ok == false then setFeedRow("not connected", C.Red)
+		else setFeedRow("ready · " .. regions, C.Gold) end
+		local n = 0
+		for _, k in ipairs({ "WEBHOOK", "LOW_WEBHOOK", "MID_WEBHOOK", "HIGH_WEBHOOK", "OG_WEBHOOK" }) do
+			if (Config[k] or ""):find("^https://") then n += 1 end
+		end
+		if n > 0 then setHookRow(n .. " channels linked", C.Green) else setHookRow("off", C.Dim) end
+		setHopRow(Config.AUTO_HOP and "scanning + hopping" or "watching this server", Config.AUTO_HOP and C.Green or C.Gold)
+		task.wait(1)
+	end
+end)
+
+-- log
+create("TextLabel", {
+	Position = UDim2.fromOffset(2, 238), Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, Font = FONT_X,
+	Text = "FOUND IN SERVER " .. string.upper(string.sub(game.JobId, 1, 8)), TextSize = 10, TextColor3 = C.Text, TextXAlignment = Enum.TextXAlignment.Left, Parent = Body,
+})
+local Log = create("ScrollingFrame", {
+	Position = UDim2.fromOffset(0, 258), Size = UDim2.new(1, 0, 1, -258), BackgroundColor3 = C.Card,
+	BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = C.White, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(), Parent = Body,
+})
+corner(Log, 10)
+stroke(Log)
+create("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 9), PaddingBottom = UDim.new(0, 6), Parent = Log })
+create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder, Parent = Log })
+
+local logCount = 0
+local function logRow(f, posted)
+	logCount += 1
+	local r = create("Frame", { LayoutOrder = logCount, Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = C.Card2, Parent = Log })
+	corner(r, 8)
+	local dot = create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 9, 0.5, 0), Size = UDim2.fromOffset(7, 7),
+		BackgroundColor3 = posted and C.Green or C.Dim, Parent = r,
+	})
+	corner(dot, 0, true)
+	create("TextLabel", {
+		Position = UDim2.fromOffset(24, 3), Size = UDim2.new(1, -110, 0, 16), BackgroundTransparency = 1, Font = FONT_B,
+		Text = (f.mutation and (f.mutation .. " ") or "") .. f.name, TextSize = 12, TextColor3 = C.Text,
+		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = r,
+	})
+	create("TextLabel", {
+		Position = UDim2.fromOffset(24, 18), Size = UDim2.new(1, -110, 0, 13), BackgroundTransparency = 1, Font = FONT,
+		Text = "@" .. tostring(f.owner or "?") .. "  ·  " .. tostring(f.tierName or "?"), TextSize = 10, TextColor3 = C.Sub,
+		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = r,
+	})
+	create("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(90, 18), BackgroundTransparency = 1,
+		Font = FONT_X, Text = (f.exact and "" or "≈ ") .. fmtMoney(f.mps), TextSize = 12, TextColor3 = posted and C.White or C.Sub,
+		TextXAlignment = Enum.TextXAlignment.Right, Parent = r,
+	})
+	local sc = create("UIScale", { Scale = 0.85, Parent = r })
+	tween(sc, 0.35, { Scale = 1 }, Enum.EasingStyle.Back)
+end
+
+-- drag + minimize
+do
+	local dragging, start, startPos
+	Header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, start, startPos = true, input.Position, Main.Position
+			input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then dragging = false end end)
+		end
+	end)
+	UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - start
+			Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+	local mini = false
+	MinBtn.MouseButton1Click:Connect(function()
+		mini = not mini
+		MinBtn.Text = mini and "+" or "—"
+		Body.Visible = not mini
+		tween(Main, 0.3, { Size = UDim2.fromOffset(W, mini and 52 or H) }, Enum.EasingStyle.Quint)
+	end)
+end
+
+local function setStatus(text, col)
+	StatusLbl.Text = string.format('<font color="#%s">●</font>  %s', (col or C.Sub):ToHex(), text)
+end
+
+local function refreshStats(here)
+	ServersVal.Text = tostring(State.servers)
+	PostedVal.Text = tostring(State.posted)
+	if here then HereVal.Text = tostring(here) end
+end
+refreshStats(0)
+
+---------------------------------------------------------------- main loop
+local postedHere = {}
+
+-- two quick passes a moment apart and merge them, so late-streaming bases aren't missed
+local function scanTwice()
+	local list, why = Scanner.scan()
+	if why then return list, why end
+	task.wait(0.35)
+	local again = Scanner.scan()
+	-- merge the passes: keep the most copies either pass saw of each brainrot (3 of the same = 3)
+	local best, rows, merged = {}, {}, {}
+	for _, pass in ipairs({ list, again or {} }) do
+		local here = {}
+		for _, f in ipairs(pass) do
+			local key = f.name .. "|" .. tostring(f.mutation) .. "|" .. tostring(f.owner or (f.carpet and "carpet")) .. "|" .. tostring(f.mps)
+			here[key] = (here[key] or 0) + 1
+			rows[key] = rows[key] or {}
+			if #rows[key] < here[key] then table.insert(rows[key], f) end
+		end
+		for key, n in pairs(here) do best[key] = math.max(best[key] or 0, n) end
+	end
+	for key, n in pairs(best) do
+		for i = 1, n do table.insert(merged, rows[key][i]) end
+	end
+	table.sort(merged, function(a, b) return a.mps > b.mps end)
+	return merged
+end
+
+local function runScan(fast)
+	setStatus("scanning bases…", C.Gold)
+	local list, why
+	if fast then list, why = scanTwice() else list, why = Scanner.scan() end
+	if why then
+		setStatus(why, C.Red)
+		return 0
+	end
+	local fresh = {}
+	local seenNow = {}
+	for _, f in ipairs(list) do
+		local key = f.name .. "|" .. tostring(f.mutation) .. "|" .. tostring(f.owner or (f.carpet and "carpet")) .. "|" .. tostring(f.mps)
+		seenNow[key] = (seenNow[key] or 0) + 1
+		-- post each copy once (postedHere counts how many of this exact brainrot went out)
+		if seenNow[key] > (postedHere[key] or 0) and f.mps >= (Config.MIN_LOG or 0) then
+			postedHere[key] = seenNow[key]
+			table.insert(fresh, f)
+		end
+	end
+	-- Discord and the AJ feed go out at the same time
+	local discordDone = false
+	task.spawn(function()
+		pcall(Feed.discord, fresh)
+		discordDone = true
+	end)
+	local ok = Feed.post(fresh)
+	if ok then
+		State.posted += #fresh
+		saveState()
+		setStatus(#fresh > 0 and ("posted " .. #fresh .. " · " .. #list .. " seen") or ("nothing above your min · " .. #list .. " seen"), C.Green)
+	else
+		setStatus("feed error: " .. tostring(Feed.lastError), C.Red)
+	end
+	-- the teleport itself takes a couple of seconds, so the log still finishes sending
+	local t0 = os.clock()
+	while not discordDone and os.clock() - t0 < (fast and 2.5 or 4) do task.wait(0.05) end
+	for _, f in ipairs(fresh) do logRow(f, ok) end
+	refreshStats(#fresh)
+	return #fresh
+end
+
+ScanBtn.MouseButton1Click:Connect(function() task.spawn(runScan) end)
+HopBtn.MouseButton1Click:Connect(function() task.spawn(Hopper.hop) end)
+HopToggle.MouseButton1Click:Connect(function()
+	Config.AUTO_HOP = not Config.AUTO_HOP
+	saveConfig()
+	paintHop()
+	-- stopping the last bot flips the channel to OFFLINE; starting again flips it ONLINE
+	task.spawn(function()
+		pcall(Status.beat)
+		if Config.AUTO_HOP then
+			pcall(Status.setChannel, true)
+		elseif not Status.othersAlive() then
+			pcall(Status.setChannel, false)
+		end
+	end)
+end)
+
+-- keep the header status live while hopping
+task.spawn(function()
+	while Gui.Parent do
+		if Hopper.busy then setStatus(Hopper.status, C.Gold) end
+		task.wait(0.2)
+	end
+end)
+
+task.spawn(function()
+	if not loaderCode() then
+		warn("[Infin Finder] save this script as " .. Config.SCRIPT_FILE .. " (or set LOADER) so it keeps running after each hop")
+	end
+	if not httpRequest then
+		setStatus("your executor has no request() - can't reach the feed", C.Red)
+		return
+	end
+
+	-- line up the next server while the bases load, so leaving is instant
+	Claims.claim(game.JobId)
+	task.spawn(function()
+		pcall(Status.beat)
+		if Config.AUTO_HOP then pcall(Status.setChannel, true) end
+	end)
+	task.spawn(Claims.load)
+	task.spawn(function() pcall(Steals.relay) end)
+	if Config.AUTO_HOP then
+		local q = {}
+		for _, id in ipairs(type(Arrival.queue) == "table" and Arrival.queue or {}) do
+			if type(id) == "string" and id ~= game.JobId and not State.visited[id] then table.insert(q, id) end
+		end
+		if #q >= 3 then
+			Hopper.list = q -- the last server already lined these up: no server-list call needed
+		else
+			task.spawn(Hopper.fetch)
+		end
+	end
+
+	if alreadyLogged then
+		-- same server as before: nothing gets logged, just move on
+		setStatus("already logged this server - not logging, hopping", C.Gold)
+		if Config.AUTO_HOP then Hopper.hop() end
+	else
+		--[[
+			Fast: wait only until the bases have loaded (signs stop changing,
+			at most SCAN_TIME), scan twice a moment apart, post the whole lobby
+			as ONE log, then hop straight away.
+		]]
+		local t0 = os.clock()
+		setStatus("loading bases…", C.Gold)
+		workspace:WaitForChild("Plots", 5)
+		Scanner.waitLoaded(Config.SCAN_TIME)
+		runScan(true)
+		markLogged()
+		print(("[Infin Finder] stayed %.1fs"):format(os.clock() - t0))
+	end
+
+	while Gui.Parent do
+		if Config.AUTO_HOP then
+			Hopper.hop()
+			task.wait(2)
+		else
+			-- staying put: keep watching this server for new brainrots
+			task.wait(8)
+			if not Config.AUTO_HOP then runScan(); task.spawn(function() pcall(Steals.relay); pcall(Status.beat) end) end
+		end
+	end
+end)
+
+print("[Infin Finder] loaded - server #" .. State.servers)
